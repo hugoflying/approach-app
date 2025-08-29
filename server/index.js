@@ -2,7 +2,6 @@ import express from "express";
 import { WebSocketServer } from "ws";
 import { AIRPORT, CFG, RUNWAY_HEADINGS, RUNWAY_TOL } from "./config.js";
 
-const SIMULATE = /^(1|true|yes)$/i.test(process.env.SIMULATE || "");
 const PORT = process.env.PORT || 8080;
 
 // ---------- Helpers ----------
@@ -43,7 +42,7 @@ const state = { alerts: new Map(), acked: new Map(), landed: new Map() };
 const flightKey = obj => obj.hex || obj.callsign || `unk-${Math.random().toString(36).slice(2)}`;
 
 const isAlignedRunway = (track, d_km) => {
-  // Appliquer l’axe piste seulement proche terrain (≤30 km).
+  // Appliquer l’axe piste seulement proche terrain (≤30 km) — évite de rater des arrivées en éloignement/attente
   if (track == null || d_km > 30) return true;
   return RUNWAY_HEADINGS.some(hdg => angDiff(track, hdg) <= RUNWAY_TOL);
 };
@@ -61,29 +60,40 @@ function isApproach(ac) {
   return true;
 }
 
-// ---------- Source 1 : OpenSky ----------
-async function fetchOpenSky() {
-  const dLat = CFG.RADIUS_KM / KM_PER_DEG_LAT;
-  const dLon = CFG.RADIUS_KM / (KM_PER_DEG_LAT * Math.cos(toRad(AIRPORT.lat)));
-  const lamin = AIRPORT.lat - dLat;
-  const lamax = AIRPORT.lat + dLat;
-  const lomin = AIRPORT.lon - dLon;
-  const lomax = AIRPORT.lon + dLon;
+// ---------- OpenSky OAuth2 (client_credentials) ----------
+let _osToken = null;
+let _osTokenExp = 0; // ms epoch
 
-  const url = `https://opensky-network.org/api/states/all?lamin=${lamin}&lomin=${lomin}&lamax=${lamax}&lomax=${lomax}`;
-  const headers = { "accept": "application/json", "user-agent": "approach-app/1.0" };
+async function getOpenSkyToken() {
+  const now = Date.now();
+  if (_osToken && now < _osTokenExp - 60_000) return _osToken;
 
-  // Auth Basic si fournie en env (Render)
-  if (process.env.OPENSKY_USER && process.env.OPENSKY_PASS) {
-    const token = Buffer.from(`${process.env.OPENSKY_USER}:${process.env.OPENSKY_PASS}`).toString("base64");
-    headers["authorization"] = `Basic ${token}`;
-  }
+  const cid = process.env.OPENSKY_CLIENT_ID;
+  const csec = process.env.OPENSKY_CLIENT_SECRET;
+  if (!cid || !csec) throw new Error("OPENSKY_CLIENT_ID/SECRET manquants");
 
-  const res = await fetchWithRetry(url, { headers });
-  const data = await res.json();
+  const tokenRes = await fetch(
+    "https://auth.opensky-network.org/auth/realms/opensky-network/protocol/openid-connect/token",
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        grant_type: "client_credentials",
+        client_id: cid,
+        client_secret: csec
+      })
+    }
+  );
+  if (!tokenRes.ok) throw new Error("OpenSky OAuth token HTTP " + tokenRes.status);
+  const j = await tokenRes.json();
+  _osToken = j.access_token;
+  _osTokenExp = Date.now() + (j.expires_in || 1800) * 1000;
+  return _osToken;
+}
+
+function parseOpenSky(data){
   const out = [];
   if (!data || !Array.isArray(data.states)) return out;
-
   for (const s of data.states) {
     const [icao24, callsign, , , last_contact, lon, lat, baro_alt, , velocity, true_track, vertical_rate, , geo_alt] = s;
     if (lat == null || lon == null) continue;
@@ -101,10 +111,39 @@ async function fetchOpenSky() {
   return out;
 }
 
-// ---------- Source 2 (fallback) : ADS-B Exchange via RapidAPI ----------
+async function fetchOpenSky() {
+  // bbox 80 km autour de LFOB
+  const dLat = CFG.RADIUS_KM / KM_PER_DEG_LAT;
+  const dLon = CFG.RADIUS_KM / (KM_PER_DEG_LAT * Math.cos(toRad(AIRPORT.lat)));
+  const lamin = AIRPORT.lat - dLat;
+  const lamax = AIRPORT.lat + dLat;
+  const lomin = AIRPORT.lon - dLon;
+  const lomax = AIRPORT.lon + dLon;
+
+  const url = `https://opensky-network.org/api/states/all?lamin=${lamin}&lomin=${lomin}&lamax=${lamax}&lomax=${lomax}`;
+  const token = await getOpenSkyToken();
+  const headers = {
+    "accept": "application/json",
+    "authorization": `Bearer ${token}`,
+    "user-agent": "approach-app/1.0"
+  };
+
+  let res = await fetchWithRetry(url, { headers });
+  if (res.status === 401) {
+    // Token expiré/invalidé → refresh 1 fois
+    _osToken = null; _osTokenExp = 0;
+    const token2 = await getOpenSkyToken();
+    res = await fetch(url, { headers: { ...headers, authorization: `Bearer ${token2}` } });
+  }
+  if (!res.ok) throw new Error("OpenSky HTTP " + res.status);
+  const data = await res.json();
+  return parseOpenSky(data);
+}
+
+// ---------- Fallback optionnel : ADS-B Exchange via RapidAPI ----------
 async function fetchADSBxRapid() {
-  if (!process.env.RAPIDAPI_KEY) return []; // pas de repli si pas de clé
-  const distNm = 43.2; // 80 km
+  if (!process.env.RAPIDAPI_KEY) return [];           // pas de fallback si pas de clé
+  const distNm = 43.2;                                // 80 km
   const url = `https://adsbexchange-com1.p.rapidapi.com/v2/lat/${AIRPORT.lat}/lon/${AIRPORT.lon}/dist/${distNm}`;
   const res = await fetch(url, {
     headers: {
@@ -135,10 +174,10 @@ async function fetchADSBxRapid() {
   return out;
 }
 
-// ---------- Orchestrateur de source ----------
+// ---------- Orchestrateur de source (OpenSky d’abord, fallback si vide) ----------
 let consecutiveOpenSkyEmpty = 0;
-const OPEN_SKY_EMPTY_LIMIT = 3;     // après 3 polls vides → fallback 2 min
-let fallbackUntil = 0;              // timestamp ms
+const OPEN_SKY_EMPTY_LIMIT = 3; // après 3 polls vides → fallback 2 min
+let fallbackUntil = 0;          // timestamp ms
 
 async function fetchTraffic() {
   const now = Date.now();
@@ -156,37 +195,15 @@ async function fetchTraffic() {
     }
   }
 
+  // Repli (si clé dispo). Si pas de clé → retournera [] et on réessaiera OpenSky au cycle suivant.
   const bx = await fetchADSBxRapid().catch(() => []);
   return bx;
-}
-
-// ---------- Simulateur (désactivé si SIMULATE=false) ----------
-function simulateSwarm() {
-  const n = Math.floor(Math.random()*3)+1;
-  const list = [];
-  for (let i=0; i<n; i++) {
-    const r = Math.random()*CFG.RADIUS_KM;
-    const theta = Math.random()*2*Math.PI;
-    const lat = AIRPORT.lat + (r / KM_PER_DEG_LAT) * Math.cos(theta);
-    const lon = AIRPORT.lon + (r / (KM_PER_DEG_LAT*Math.cos(toRad(AIRPORT.lat)))) * Math.sin(theta);
-    const hdg = RUNWAY_HEADINGS[Math.floor(Math.random()*RUNWAY_HEADINGS.length)];
-    list.push({
-      hex: Math.random().toString(16).slice(2,8),
-      callsign: `SIM${100+Math.floor(Math.random()*900)}`,
-      lat, lon,
-      gs_kts: 120 + Math.random()*80,
-      alt_ft: 8000 - Math.random()*7000,
-      track_deg: hdg,
-      vs_fpm: -(200 + Math.random()*700)
-    });
-  }
-  return list;
 }
 
 // ---------- Boucle de poll ----------
 async function poll() {
   try {
-    const items = SIMULATE ? simulateSwarm() : await fetchTraffic();
+    const items = await fetchTraffic();
     for (const ac of items) {
       const key = flightKey(ac);
 
@@ -223,11 +240,11 @@ app.use((req, res, next) => {
   if (req.method === "OPTIONS") return res.sendStatus(200);
   next();
 });
-app.get("/api/flight", (req, res) => res.json({ ok: true })); // placeholder futur
+app.get("/api/flight", (req, res) => res.json({ ok: true })); // placeholder pour futures intégrations
 app.use(express.static("public"));
 
 const server = app.listen(PORT, () =>
-  console.log(`HTTP on :${PORT} — SIMULATE=${SIMULATE}`)
+  console.log(`HTTP on :${PORT} — REAL TRAFFIC (no simulate)`)
 );
 
 // ---------- WebSocket ----------
@@ -243,7 +260,7 @@ wss.on("connection", ws => {
       if (msg.type === "ACK" && msg.key) {
         if (state.alerts.has(msg.key)) {
           const ac = state.alerts.get(msg.key).snapshot;
-          state.alerts.delete(msg.key);
+          state.alerts.delete(key);
           state.acked.set(msg.key, { acked_at: Date.now(), snapshot: ac });
           ws.send(JSON.stringify({ type: "ACK_OK", key: msg.key }));
         }
