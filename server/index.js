@@ -12,7 +12,7 @@ const msToKts = v => v == null ? null : v * 1.9438444924;
 const mToFt   = m => m == null ? null : m * 3.280839895;
 const msToFpm = v => v == null ? null : v * 196.8503937;
 const angDiff = (a, b) => Math.abs((((a - b) % 360) + 540) % 360 - 180);
-const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+const sleep   = (ms) => new Promise(r => setTimeout(r, ms));
 
 function haversineKm(lat1, lon1, lat2, lon2) {
   const R = 6371.0;
@@ -23,7 +23,7 @@ function haversineKm(lat1, lon1, lat2, lon2) {
 }
 
 async function fetchWithRetry(url, options = {}, tries = 4) {
-  let delay = 800; // ms
+  let delay = 800;
   for (let i = 0; i < tries; i++) {
     try {
       const res = await fetch(url, { ...options, redirect: "follow" });
@@ -32,7 +32,7 @@ async function fetchWithRetry(url, options = {}, tries = 4) {
       throw new Error(`HTTP ${res.status}`);
     } catch (e) {
       if (i === tries - 1) throw e;
-      await sleep(delay + Math.floor(Math.random() * 400)); // backoff + jitter
+      await sleep(delay + Math.floor(Math.random() * 400));
       delay = Math.min(delay * 2, 6000);
     }
   }
@@ -46,25 +46,27 @@ const state = {
 };
 const flightKey = obj => obj.hex || obj.callsign || `unk-${Math.random().toString(36).slice(2)}`;
 
-const isAlignedRunway = track =>
-  track == null ? true : RUNWAY_HEADINGS.some(hdg => angDiff(track, hdg) <= RUNWAY_TOL);
+const isAlignedRunway = (track, d_km) => {
+  // Filtre axe seulement proche terrain (30 km) car loin les caps varient
+  if (track == null || d_km > 30) return true;
+  return RUNWAY_HEADINGS.some(hdg => angDiff(track, hdg) <= RUNWAY_TOL);
+};
 
 function isApproach(ac) {
   const d_km = haversineKm(ac.lat, ac.lon, AIRPORT.lat, AIRPORT.lon);
   if (d_km > CFG.RADIUS_KM) return false;
   if (ac.alt_ft == null || ac.alt_ft > CFG.ALT_MAX_FT) return false;
-  if (ac.vs_fpm != null && ac.vs_fpm > 0) return false;          // monte
-  if (!isAlignedRunway(ac.track_deg)) return false;              // pas dans l'axe 12/30
-  if (ac.gs_kts != null && ac.gs_kts > 20) {                      // ETA max
+  if (ac.vs_fpm != null && ac.vs_fpm > 0) return false;   // monte
+  if (!isAlignedRunway(ac.track_deg, d_km)) return false; // pas dans l'axe 12/30 proche terrain
+  if (ac.gs_kts != null && ac.gs_kts > 20) {               // ETA max
     const eta_min = (d_km / (ac.gs_kts * 1.852)) * 60;
     if (eta_min > CFG.ETA_MAX_MIN) return false;
   }
   return true;
 }
 
-// ---------- OpenSky ----------
+// ---------- Source 1 : OpenSky ----------
 async function fetchOpenSky() {
-  // bbox ~80 km autour de LFOB
   const dLat = CFG.RADIUS_KM / KM_PER_DEG_LAT;
   const dLon = CFG.RADIUS_KM / (KM_PER_DEG_LAT * Math.cos(toRad(AIRPORT.lat)));
   const lamin = AIRPORT.lat - dLat;
@@ -74,8 +76,6 @@ async function fetchOpenSky() {
 
   const url = `https://opensky-network.org/api/states/all?lamin=${lamin}&lomin=${lomin}&lamax=${lamax}&lomax=${lomax}`;
   const headers = { "accept": "application/json", "user-agent": "approach-app/1.0" };
-
-  // Auth Basic si dispo dans les variables d'env (Render)
   if (process.env.OPENSKY_USER && process.env.OPENSKY_PASS) {
     const token = Buffer.from(`${process.env.OPENSKY_USER}:${process.env.OPENSKY_PASS}`).toString("base64");
     headers["authorization"] = `Basic ${token}`;
@@ -101,6 +101,68 @@ async function fetchOpenSky() {
     });
   }
   return out;
+}
+
+// ---------- Source 2 (repli) : ADS-B Exchange via RapidAPI ----------
+async function fetchADSBxRapid() {
+  if (!process.env.RAPIDAPI_KEY) return []; // pas de repli si pas de clé
+  const distNm = 43.2; // 80 km
+  const url = `https://adsbexchange-com1.p.rapidapi.com/v2/lat/${AIRPORT.lat}/lon/${AIRPORT.lon}/dist/${distNm}`;
+  const res = await fetch(url, {
+    headers: {
+      "X-RapidAPI-Key": process.env.RAPIDAPI_KEY,
+      "X-RapidAPI-Host": "adsbexchange-com1.p.rapidapi.com",
+      "accept": "application/json"
+    }
+  });
+  if (!res.ok) throw new Error(`ADSBx RapidAPI HTTP ${res.status}`);
+  const data = await res.json();
+  const list = data.ac || data.aircraft || [];
+  const out = [];
+  for (const a of list) {
+    const lat = a.lat ?? a.latitude;
+    const lon = a.lon ?? a.longitude;
+    if (lat == null || lon == null) continue;
+    out.push({
+      hex: (a.hex || a.icao || "").toUpperCase() || null,
+      callsign: (a.call || a.callsign || "").trim() || null,
+      lat, lon,
+      gs_kts: a.gs ?? a.spd ?? null,
+      alt_ft: a.alt_baro ?? a.alt_geom ?? a.alt ?? null,
+      track_deg: a.trak ?? a.track ?? null,
+      vs_fpm: a.baro_rate ?? a.vert_rate ?? null,
+      last_ts: a.seen_pos ? (Date.now()/1000 - a.seen_pos) : Date.now()/1000
+    });
+  }
+  return out;
+}
+
+// ---------- Choix automatique de source ----------
+let consecutiveOpenSkyEmpty = 0;
+const OPEN_SKY_EMPTY_LIMIT = 3; // au bout de 3 polls vides, on bascule en repli pendant 2 min
+let fallbackUntil = 0;
+
+async function fetchTraffic() {
+  const now = Date.now();
+  const inFallback = now < fallbackUntil;
+
+  if (!inFallback) {
+    // Essai OpenSky
+    const os = await fetchOpenSky().catch(() => []);
+    if (os.length > 0) {
+      consecutiveOpenSkyEmpty = 0;
+      return os;
+    }
+    consecutiveOpenSkyEmpty++;
+    if (consecutiveOpenSkyEmpty >= OPEN_SKY_EMPTY_LIMIT) {
+      // Active repli 2 minutes
+      fallbackUntil = now + 2 * 60 * 1000;
+    }
+  }
+
+  // Repli ADSBx (si clé absente -> retour [])
+  const bx = await fetchADSBxRapid().catch(() => []);
+  return bx;
 }
 
 // ---------- Simulateur ----------
@@ -129,11 +191,12 @@ function simulateSwarm() {
 // ---------- Boucle de poll ----------
 async function poll() {
   try {
-    const items = SIMULATE ? simulateSwarm() : await fetchOpenSky();
+    const items = SIMULATE ? simulateSwarm() : await fetchTraffic();
+    // console.log("items:", items.length); // debug si besoin
     for (const ac of items) {
       const key = flightKey(ac);
 
-      // Posé → passe en "landed"
+      // Posé → "landed"
       if (ac.alt_ft != null && ac.alt_ft < 200 && ac.gs_kts != null && ac.gs_kts < 50) {
         state.alerts.delete(key);
         state.acked.delete(key);
@@ -152,7 +215,6 @@ async function poll() {
   } catch (e) {
     console.error("poll error:", e.message);
   } finally {
-    // Jitter ±1 s pour lisser la charge et limiter les ratelimits cloud
     const jitter = 1000 - Math.floor(Math.random() * 2000); // [-1000,+1000]
     setTimeout(poll, Math.max(5000, CFG.POLL_MS + jitter));
   }
@@ -160,8 +222,6 @@ async function poll() {
 
 // ---------- Serveur Web ----------
 const app = express();
-
-// CORS permissif (utile si tu sers le front ailleurs)
 app.use((req, res, next) => {
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
@@ -169,11 +229,9 @@ app.use((req, res, next) => {
   if (req.method === "OPTIONS") return res.sendStatus(200);
   next();
 });
-
-// Endpoint placeholder pour futures API externes (clé cachée côté serveur)
 app.get("/api/flight", (req, res) => res.json({ ok: true }));
-
 app.use(express.static("public"));
+
 const server = app.listen(PORT, () =>
   console.log(`HTTP on :${PORT} — SIMULATE=${SIMULATE}`)
 );
@@ -184,7 +242,6 @@ function broadcast(obj) {
   const s = JSON.stringify(obj);
   wss.clients.forEach(c => { try { c.send(s); } catch {} });
 }
-
 wss.on("connection", ws => {
   ws.on("message", raw => {
     try {
@@ -199,8 +256,6 @@ wss.on("connection", ws => {
       }
     } catch {}
   });
-
-  // (optionnel) on pourrait renvoyer l’état courant ici si on persistait
   ws.send(JSON.stringify({ type: "INIT" }));
 });
 
