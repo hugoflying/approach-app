@@ -143,7 +143,7 @@ async function fetchOpenSky() {
 // ---------- Fallback optionnel : ADS-B Exchange via RapidAPI ----------
 async function fetchADSBxRapid() {
   if (!process.env.RAPIDAPI_KEY) return [];           // pas de fallback si pas de clé
-  const distNm = 43.2;                                // 80 km
+  const distNm = 80;                                // 80 km
   const url = `https://adsbexchange-com1.p.rapidapi.com/v2/lat/${AIRPORT.lat}/lon/${AIRPORT.lon}/dist/${distNm}`;
   const res = await fetch(url, {
     headers: {
