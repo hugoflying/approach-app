@@ -1,0 +1,105 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Approches — LFOB</title>
+  <style>
+    body { background:#0b1220; color:#e7ecf3; font-family: system-ui, sans-serif; margin:0; }
+    header { padding: 16px 20px; border-bottom: 1px solid #1f2937; position: sticky; top:0; background:#0b1220; }
+    h1 { margin:0; font-size: 18px; }
+    .grid { display:grid; grid-template-columns: 1fr 1fr 1fr; gap:16px; padding:16px; }
+    .col h2 { font-size:14px; color:#aab4c3; margin:8px 0; }
+    .card { border:1px solid #253042; border-radius: 14px; padding: 12px 14px; background: #0f172a; }
+    .alert { background:#7f1d1d; border-color:#ef4444; box-shadow: 0 0 0 2px rgba(239,68,68,.2) inset; animation: pulse 1s infinite; }
+    @keyframes pulse { 0%{filter:brightness(1);} 50%{filter:brightness(1.35);} 100%{filter:brightness(1);} }
+    .row { display:flex; align-items:center; justify-content:space-between; gap:12px; }
+    .id { font-weight:700; }
+    .meta { font-size:12px; color:#dbe2ea; opacity:.85 }
+    .btn { cursor:pointer; background:white; color:#991b1b; font-weight:700; border:none; border-radius:10px; padding:6px 10px; }
+    .btn:hover { filter:brightness(.95) }
+    .list { display:flex; flex-direction:column; gap:10px; }
+    .muted { opacity:.8 }
+    .footer { padding: 12px 16px; font-size: 12px; color:#9fb1c7; border-top:1px solid #1f2937; }
+    @media (max-width: 900px){ .grid{ grid-template-columns: 1fr; } }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Approches — <span class="muted">LFOB/BVA</span> · Rayon 80 km · Pistes 12/30 only · Alt ≤ 10 000 ft</h1>
+  </header>
+  <main class="grid">
+    <section class="col">
+      <h2>ALERTES</h2>
+      <div id="alerts" class="list"></div>
+    </section>
+    <section class="col">
+      <h2>À L’APPROCHE (ACK)</h2>
+      <div id="acked" class="list"></div>
+    </section>
+    <section class="col">
+      <h2>AU SOL</h2>
+      <div id="landed" class="list"></div>
+    </section>
+  </main>
+  <div class="footer">Astuce : touche <b>A</b> pour ACK la première alerte.</div>
+
+  <script>
+    const alertsEl = document.getElementById('alerts');
+    const ackedEl = document.getElementById('acked');
+    const landedEl = document.getElementById('landed');
+    const ws = new WebSocket((location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host);
+
+    const alerts = new Map();
+
+    function render() {
+      alertsEl.innerHTML = '';
+      for (const [key, a] of alerts) {
+        const div = document.createElement('div');
+        div.className = 'card alert';
+        const id = a.callsign || a.hex || key;
+        div.innerHTML = `<div class="row"><div><div class="id">${id}</div></div><button class="btn">ACK</button></div>`;
+        div.querySelector('button').onclick = () => ack(key);
+        alertsEl.appendChild(div);
+      }
+    }
+
+    function ack(key){
+      ws.send(JSON.stringify({ type: 'ACK', key }));
+      const a = alerts.get(key);
+      if (a) {
+        alerts.delete(key); render();
+        const li = document.createElement('div');
+        li.className = 'card';
+        const id = a.callsign || a.hex || key;
+        li.innerHTML = `<div class="id">${id}</div>`;
+        ackedEl.prepend(li);
+      }
+    }
+
+    ws.onmessage = (ev) => {
+      const msg = JSON.parse(ev.data);
+      if (msg.type === 'APPROACH_ALERT') {
+        alerts.set(msg.key, msg);
+        render();
+      }
+      if (msg.type === 'ACK_OK') {
+        // déjà géré
+      }
+      if (msg.type === 'LANDED') {
+        const div = document.createElement('div');
+        div.className = 'card';
+        div.innerHTML = `<div class="id">${msg.callsign || msg.hex || msg.key}</div><div class="meta">Au sol</div>`;
+        landedEl.prepend(div);
+      }
+    };
+
+    document.addEventListener('keydown', (e) => {
+      if (e.key.toLowerCase() === 'a') {
+        const first = alerts.keys().next();
+        if (!first.done) ack(first.value);
+      }
+    });
+  </script>
+</body>
+</html>
